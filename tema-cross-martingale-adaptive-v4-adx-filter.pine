@@ -1,0 +1,153 @@
+//@version=5
+strategy('TEMA Cross Martingale (Adaptive V4 + ADX Filter no H)',
+     overlay=true, precision=7, pyramiding=100,
+     default_qty_type=strategy.fixed, default_qty_value=1,
+     initial_capital=100000, commission_type=strategy.commission.percent,
+     commission_value=0.25)
+
+// === 1. Base Structure ===
+temaLen = input.int(6,    title="TEMA length",      group=" 1. Base Structure ──────────────")
+smaLen  = input.int(3,    title="SMA length",       group=" 1. Base Structure ──────────────")
+smmaLen = input.int(5,    title="SMMA length",      group=" 1. Base Structure ──────────────")
+
+minGainPercent = input.float(2.5, title='Base TP (%)',         group=" 1. Base Structure ──────────────")
+avgProtToggle  = input.bool(true,  title='Allow avg only below avg', group=" 1. Base Structure ──────────────")
+gainProtToggle = input.bool(true,  title='Require price ≥ TP',       group=" 1. Base Structure ──────────────")
+gainMult       = 1 + minGainPercent * 0.01
+
+// === 2. Boost Settings ===
+boostDropTh = input.float(0.5, title='Boost if drop > (%)',        group=" 2. Boost ──────────────") * 0.01
+boostMult   = input.float(1.2, title='Boost size multiplier',      group=" 2. Boost ──────────────")
+boostLimEn  = input.bool(true,  title='Enable boost limits',       group=" 2. Boost ──────────────")
+boostMaxTot = input.int(5,     title='Max boosts per position',   group=" 2. Boost ──────────────")
+boostMaxSeq = input.int(3,     title='Max consecutive boosts',     group=" 2. Boost ──────────────")
+boostSkipN  = input.int(5,     title='Skip boost for first N',     group=" 2. Boost ──────────────")
+
+// === 3. Martingale Settings ===
+baseQty  = input.float(0.2,  title='Initial order qty',         group=" 3. Martingale Settings ──────────────")
+k0       = input.float(1.01, title='Base multiplier K₀',        group=" 3. Martingale Settings ──────────────")
+deltaK   = input.float(0.005,title='ΔK per step',               group=" 3. Martingale Settings ──────────────")
+quadStep = input.bool(false, title='Use quadratic growth?',     group=" 3. Martingale Settings ──────────────")
+
+// === 4. Adaptive Distance Filter Settings ===
+enableDistFilter = input.bool(true,    title='Enable Adaptive Distance Filter', group=" 4. Adaptive Distance Filter ──────────────")
+minDistPct       = input.float(0.5,    title='Base distance % from prev buy',    step=0.1, group=" 4. Adaptive Distance Filter ──────────────")
+
+// === 5. ADX Adaptive Filter Settings ===
+enableAdxAdapt        = input.bool(true,       title='Enable ADX adaptive filter',         group=" 5. ADX Adaptive Filter ──────────────")
+disableOrdersOnFilter = input.bool(false,      title='Disable orders when filter active',   group=" 5. ADX Adaptive Filter ──────────────")
+adxTF                 = input.timeframe('60', title='ADX TF (for filter)',                 group=" 5. ADX Adaptive Filter ──────────────")
+i_sigLen              = input.int(14,          title='ADX smoothing (sigLen)',             group=" 5. ADX Adaptive Filter ──────────────")
+i_diLen               = input.int(14,          title='DI length (diLen)',                  group=" 5. ADX Adaptive Filter ──────────────")
+i_hlRange             = input.int(20,          title='Level Range (hlRange)',              group=" 5. ADX Adaptive Filter ──────────────")
+// manual overrides when filter active
+filterK0              = input.float(1.01,       title='Filter K₀ (when active)',            group=" 5. ADX Adaptive Filter ──────────────")
+filterDeltaK          = input.float(0.005,      title='Filter ΔK (when active)',            group=" 5. ADX Adaptive Filter ──────────────")
+filterMinDistPct      = input.float(0.5,        title='Filter minDistPct %', step=0.1,    group=" 5. ADX Adaptive Filter ──────────────")
+
+// ——— Functions ———
+tema(src, len) =>
+    3 * ta.ema(src, len) - 3 * ta.ema(ta.ema(src, len), len) + ta.ema(ta.ema(ta.ema(src, len), len), len)
+
+smma(src, len) =>
+    var float sa = na
+    sa := na(sa[1]) ? ta.sma(src, len) : (sa[1] * (len - 1) + src) / len
+    sa
+
+f_dirMov(_len) =>
+    up = ta.change(high)
+    dn = -ta.change(low)
+    p  = nz(up > dn and up > 0 ? up : 0)
+    m  = nz(dn > up and dn > 0 ? dn : 0)
+    trur = ta.rma(ta.tr, _len)
+    [fixnan(100 * ta.rma(p, _len) / trur), fixnan(100 * ta.rma(m, _len) / trur)]
+
+f_sig(_di, _sg) =>
+    [p, m] = f_dirMov(_di)
+    100 * ta.rma(math.abs(p - m) / (p + m == 0 ? 1 : p + m), _sg)
+
+// ——— Price & Moving Averages ———
+tema1 = tema(close, temaLen)
+sma1  = ta.sma(tema1, smaLen)
+smma1 = smma(close, smmaLen)
+plot(tema1, color=color.new(color.green, 0), title='TEMA')
+plot(sma1,  color=color.new(color.orange,0), title='SMA')
+plot(smma1, color=color.new(color.red,  0), title='SMMA')
+
+longCond  = ta.crossover(tema1, sma1) and tema1 < smma1
+shortCond = ta.crossunder(tema1, sma1)
+
+// ——— Adaptive Distance & ADX Filter ———
+var float prevBuyPrice = na
+
+// — HTF ADX/DI —
+[diPlusHTF, diMinusHTF] = request.security(syminfo.tickerid, adxTF, f_dirMov(i_diLen))
+sigHTF                  = request.security(syminfo.tickerid, adxTF, f_sig(i_diLen, i_sigLen))
+
+// — conditions for Gu5 dark-red ADX state —
+diDownHTF     = diMinusHTF > diPlusHTF           // DI⁻ доминирует
+aboveRangeHTF = sigHTF > i_hlRange                // ADX выше Range
+filterActive  = enableAdxAdapt and diDownHTF and aboveRangeHTF
+allowOrders   = not (disableOrdersOnFilter and filterActive)
+
+// — effective settings when filter active —
+minDistEff    = filterActive ? filterMinDistPct : minDistPct
+k0_eff        = filterActive ? filterK0     : k0
+deltaK_eff    = filterActive ? filterDeltaK : deltaK
+
+priceMovePct  = na(prevBuyPrice) ? na : math.abs(close - prevBuyPrice) / prevBuyPrice * 100
+distOk        = not enableDistFilter or na(prevBuyPrice) or priceMovePct >= minDistEff
+
+// ——— Runtime Reset & Vars ———
+var float lastQty    = baseQty
+var int   qtyStep    = 0
+var int   orderCount = 0
+var int   boostTot   = 0
+var int   boostSeq   = 0
+
+if strategy.position_size == 0 and strategy.position_size[1] != 0
+    lastQty      := baseQty
+    qtyStep      := 0
+    orderCount   := 0
+    boostTot     := 0
+    boostSeq     := 0
+    prevBuyPrice := na
+
+// ——— Martingale & Entry Logic ———
+canAvgDown = strategy.position_size > 0 and close < strategy.position_avg_price and distOk
+if canAvgDown and allowOrders
+    qtyStep += 1
+    mult     = quadStep ? deltaK_eff * math.pow(qtyStep, 2) : deltaK_eff * qtyStep
+    lastQty  *= (k0_eff + mult)
+
+useBoost = canAvgDown and (nz(prevBuyPrice) - close) / nz(prevBuyPrice) >= boostDropTh and
+           (not boostLimEn or (boostTot < boostMaxTot and boostSeq < boostMaxSeq)) and
+           strategy.opentrades >= boostSkipN
+
+isFirst  = strategy.position_size == 0 and strategy.closedtrades == 0
+qtyOrder = isFirst ? baseQty : lastQty * (useBoost ? boostMult : 1)
+qtyOrder := math.ceil(qtyOrder * 1000) / 1000
+
+canEnter = longCond and distOk and allowOrders and
+           (na(strategy.position_avg_price) or (avgProtToggle ? close <= strategy.position_avg_price : true))
+if canEnter
+    strategy.entry('Buy', strategy.long, qty=qtyOrder)
+    orderCount    += 1
+    prevBuyPrice   := close
+    label.new(bar_index, high, str.tostring(orderCount), style=label.style_none,
+              textcolor=color.gray, yloc=yloc.abovebar, size=size.small)
+    if useBoost
+        boostTot += 1
+        boostSeq += 1
+    else
+        boostSeq := 0
+
+// ——— Take-Profit / Close ———
+gainCondition = not na(strategy.position_avg_price) and (gainProtToggle ? close >= gainMult * strategy.position_avg_price : false)
+if shortCond and gainCondition
+    strategy.close_all()
+
+// ——— Boost Marker ———
+plotshape(useBoost and strategy.opentrades > strategy.opentrades[1],
+      title='BoostDot', style=shape.circle, size=size.tiny,
+      color=color.new(color.aqua, 0), location=location.abovebar)
