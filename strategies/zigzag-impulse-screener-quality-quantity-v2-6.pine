@@ -1,0 +1,318 @@
+//@version=5
+indicator("ZigZag Impulse Screener — Quality × Quantity (v2.6 fixed UI, HA purity, frozen threshold)", overlay=false, max_bars_back=5000)
+
+// ===== Inputs =====
+scanTf       = input.timeframe("",  "Scan timeframe (blank = chart TF)")
+lookback     = input.int(600,       "Lookback, bars", minval=100)
+
+// ZigZag threshold
+zzMode       = input.string("Percent", "Threshold type", options=["Percent","ATR x Mult"])
+threshPct    = input.float(3.0, "Percent threshold %", step=0.1)
+atrLen       = input.int(14,   "ATR length", minval=1)
+atrMult      = input.float(3.0,"ATR multiplier", step=0.1)
+minBars      = input.int(5,    "Min bars per swing", minval=1)
+freezeThr    = input.bool(true,"Freeze threshold at pivot")
+
+// Heikin-Ashi options
+useHAforPur  = input.bool(true,  "Purity on Heikin-Ashi")
+useHAforZZ   = input.bool(false, "Detect swings on Heikin-Ashi (experimental)")
+
+// Liquidity & UI
+minTurnUSD   = input.float(0,    "Min avg turnover per bar, $ (set >0 after first run)", step=1e5)
+drawAlways   = input.bool(true,  "Draw table on any bar (not only last)")
+debugBadge   = input.bool(true,  "Show debug counts at title")
+
+// Ranking weights
+wQuality     = input.float(1.0, "Weight: Quality", step=0.1)
+wQuantity    = input.float(0.7, "Weight: Quantity", step=0.1)
+topN         = input.int(25,    "Show top N", minval=1, maxval=50)
+
+// ----- timeframe resolve
+_tf = (scanTf == "") ? timeframe.period : scanTf
+
+// ===== 12 symbols via input.symbol (pencil) =====
+sym01 = input.symbol("BINANCE:BTCUSDT",  "Symbol 01")
+sym02 = input.symbol("BINANCE:ETHUSDT",  "Symbol 02")
+sym03 = input.symbol("BINANCE:BNBUSDT",  "Symbol 03")
+sym04 = input.symbol("BINANCE:SOLUSDT",  "Symbol 04")
+sym05 = input.symbol("BINANCE:XRPUSDT",  "Symbol 05")
+sym06 = input.symbol("BINANCE:DOGEUSDT", "Symbol 06")
+sym07 = input.symbol("BINANCE:ADAUSDT",  "Symbol 07")
+sym08 = input.symbol("BINANCE:TRXUSDT",  "Symbol 08")
+sym09 = input.symbol("BINANCE:LINKUSDT", "Symbol 09")
+sym10 = input.symbol("BINANCE:TONUSDT",  "Symbol 10")
+sym11 = input.symbol("BINANCE:AVAXUSDT", "Symbol 11")
+sym12 = input.symbol("BINANCE:MATICUSDT","Symbol 12")
+
+// ===== Helpers =====
+thr_percent(p, pct) => p * (pct / 100.0)
+thr_atr(a, mult)    => a * mult
+sumN(src, len)      => nz(ta.sma(src, len) * len, 0.0)
+
+// swaps
+swap_f(float[] a, int i, int j) =>
+    t = array.get(a,i)
+    array.set(a,i,array.get(a,j))
+    array.set(a,j,t)
+swap_s(string[] a, int i, int j) =>
+    t = array.get(a,i)
+    array.set(a,i,array.get(a,j))
+    array.set(a,j,t)
+
+// === Fixed table style (no inputs) ===
+const int    BORDER_W    = 1
+const int    COLS        = 11
+const color  HDR_BG      = color.rgb(12, 80, 180)
+const color  HDR_TXT     = color.white
+const color  ROW_ODD_BG  = color.rgb(28, 30, 36)
+const color  ROW_EVEN_BG = color.rgb(18, 20, 24)
+const color  ROW_TXT     = color.rgb(235, 235, 235)
+const bool   HEATMAP     = true
+const float  RANK_LO     = 20.0,  RANK_HI = 90.0
+const float  PUR_LO      = 55.0,  PUR_HI  = 80.0
+const float  ER_LO       = 0.50,  ER_HI   = 0.80
+
+// ВАЖНО: для position используем обычную var (инициализируется один раз)
+var TBL_POS = position.top_right
+
+// helpers for heatmap
+mixColor(c1, c2, t) =>
+    r = int(color.r(c1) + (color.r(c2) - color.r(c1)) * t)
+    g = int(color.g(c1) + (color.g(c2) - color.g(c1)) * t)
+    b = int(color.b(c1) + (color.b(c2) - color.b(c1)) * t)
+    color.rgb(r, g, b)
+heat(val, lo, hi) =>
+    v = math.max(0.0, math.min(1.0, (val - lo) / math.max(1e-9, hi - lo)))
+    mid = 0.5
+    v < mid ? mixColor(color.rgb(200,60,60),  color.rgb(240,200,60), v/mid) : mixColor(color.rgb(240,200,60), color.rgb(70,200,90),  (v-mid)/(1-mid))
+
+// ===== Core per-symbol calc =====
+calc_symbol() =>
+    // Heikin-Ashi
+    haClose = (open + high + low + close) / 4.0
+    var float haOpen = na
+    haOpen := na(haOpen[1]) ? (open + close)/2.0 : (haOpen[1] + haClose[1]) / 2.0
+    haHigh  = math.max(high, math.max(haOpen, haClose))
+    haLow   = math.min(low,  math.min(haOpen, haClose))
+
+    // Purity source
+    bullCore = useHAforPur ? (haClose >= haOpen) : (close >= open)
+    bearCore = useHAforPur ? (haClose <= haOpen) : (close <= open)
+
+    // Series for swings
+    _h = useHAforZZ ? haHigh  : high
+    _l = useHAforZZ ? haLow   : low
+    _c = useHAforZZ ? haClose : close
+
+    atrReal = ta.atr(atrLen)
+
+    var float pivot   = na
+    var float extreme = na
+    var int   dir     = 0
+    var int   curLen  = 0
+    var int   curGood = 0
+    var float pathSum = 0.0
+    var float thrFrz  = na
+
+    if na(pivot)
+        pivot   := _c
+        extreme := _c
+        dir     := 0
+        curLen  := 0
+        curGood := 0
+        pathSum := 0.0
+        thrFrz  := na
+
+    thrDyn = zzMode == "Percent" ? thr_percent(pivot, threshPct) : thr_atr(atrReal, atrMult)
+    thrUse = freezeThr ? (na(thrFrz) ? thrDyn : thrFrz) : thrDyn
+
+    if dir == 0
+        dir   := _c >= pivot ? 1 : -1
+        thrFrz := freezeThr ? thrDyn : na
+
+    if dir == 1
+        if _h >= extreme
+            extreme := _h
+    else
+        if _l <= extreme
+            extreme := _l
+
+    pathSum += math.abs(_c - nz(_c[1], _c))
+    curLen  += 1
+    curGood += dir == 1 ? (bullCore ? 1 : 0) : (bearCore ? 1 : 0)
+
+    canClose = curLen >= minBars
+    condUp   = (extreme - _c) >= thrUse and canClose
+    condDn   = (_c - extreme) >= thrUse and canClose
+    reversal = dir == 1 ? condUp : condDn
+
+    eCount=0.0, eScore=0.0, ePur=0.0, eLen=0.0, eER=0.0, eUp=0.0, eDown=0.0
+    if reversal
+        swingLen   = curLen
+        swingMove  = math.abs(extreme - pivot)
+        swingRetPc = pivot != 0.0 ? (swingMove / pivot) * 100.0 : 0.0
+        purity01   = swingLen > 0 ? (curGood / swingLen) : 0.0
+        erSwing    = pathSum > 0 ? (swingMove / pathSum) : 0.0
+        score      = swingRetPc * purity01 * math.sqrt(swingLen)
+
+        eCount := 1
+        eScore := score
+        ePur   := purity01 * 100.0
+        eLen   := swingLen
+        eER    := erSwing
+        if dir == 1
+            eUp := 1
+        else
+            eDown := 1
+
+        pivot   := extreme
+        dir     := dir * -1
+        extreme := _c
+        curLen  := 1
+        curGood := dir == 1 ? (bullCore ? 1 : 0) : (bearCore ? 1 : 0)
+        pathSum := math.abs(_c - nz(_c[1], _c))
+        thrFrz  := freezeThr ? (zzMode == "Percent" ? thr_percent(pivot, threshPct) : thr_atr(atrReal, atrMult)) : na
+
+    // Aggregate
+    N       = sumN(eCount, lookback)
+    Sscore  = sumN(eScore, lookback)
+    Spur    = sumN(ePur,   lookback)
+    Slen    = sumN(eLen,   lookback)
+    SER     = sumN(eER,    lookback)
+    Sup     = sumN(eUp,    lookback)
+    Sdown   = sumN(eDown,  lookback)
+
+    avgScore = N > 0 ? (Sscore / N) : 0.0
+    avgPur   = N > 0 ? (Spur   / N) : 0.0
+    avgLen   = N > 0 ? (Slen   / N) : 0.0
+    avgERsw  = N > 0 ? (SER    / N) : 0.0
+    qtyPer100 = 100.0 * (N / lookback)
+    biasUp    = (Sup + Sdown) > 0 ? Sup / (Sup + Sdown) : 0.5
+
+    atrPct = (ta.atr(atrLen) / close) * 100.0
+    turn   = close * ta.sma(volume, 50)
+
+    [N, avgScore, qtyPer100, avgPur, avgLen, avgERsw, biasUp, atrPct, turn]
+
+// ===== Storage =====
+var string[] SYM  = array.new_string()
+var float[]  RANK = array.new_float()
+var float[]  N_   = array.new_float()
+var float[]  AVG  = array.new_float()
+var float[]  Q100 = array.new_float()
+var float[]  PUR  = array.new_float()
+var float[]  LEN  = array.new_float()
+var float[]  ERS  = array.new_float()
+var float[]  ATRP = array.new_float()
+var float[]  TURN = array.new_float()
+var float[]  BIAS = array.new_float()
+
+array.clear(SYM)
+array.clear(RANK)
+array.clear(N_)
+array.clear(AVG)
+array.clear(Q100)
+array.clear(PUR)
+array.clear(LEN)
+array.clear(ERS)
+array.clear(ATRP)
+array.clear(TURN)
+array.clear(BIAS)
+
+// ===== Per-symbol caller (no condition around request.security) =====
+process(sym) =>
+    fallback = "BINANCE:BTCUSDT"
+    symEff   = str.length(sym) > 0 ? sym : fallback
+
+    [N, avgScore, qty100, avgPur, avgLen, avgERsw, biasUp, atrPct, turn] = request.security(symEff, _tf, calc_symbol(), barmerge.gaps_off, barmerge.lookahead_off)
+
+    if str.length(sym) > 0
+        passTurn = not na(turn) and turn >= minTurnUSD
+        if passTurn
+            rank = wQuality*avgScore + wQuantity*qty100
+            array.push(SYM,  sym)
+            array.push(RANK, rank)
+            array.push(N_,   N)
+            array.push(AVG,  avgScore)
+            array.push(Q100, qty100)
+            array.push(PUR,  avgPur)
+            array.push(LEN,  avgLen)
+            array.push(ERS,  avgERsw)
+            array.push(ATRP, atrPct)
+            array.push(TURN, turn)
+            array.push(BIAS, biasUp)
+
+// ---- Call for each symbol (choose via pencil) ----
+process(sym01), process(sym02), process(sym03), process(sym04), process(sym05), process(sym06)
+process(sym07), process(sym08), process(sym09), process(sym10), process(sym11), process(sym12)
+
+// ---- Sort by RANK desc (safe bounds) ----
+int sz = array.size(RANK)
+if sz >= 2
+    for i = 0 to (sz - 2)
+        int maxIdx = i
+        for j = i + 1 to (sz - 1)
+            if array.get(RANK, j) > array.get(RANK, maxIdx)
+                maxIdx := j
+        if maxIdx != i
+            swap_f(RANK, i, maxIdx)
+            swap_s(SYM,  i, maxIdx)
+            swap_f(N_,   i, maxIdx)
+            swap_f(AVG,  i, maxIdx)
+            swap_f(Q100, i, maxIdx)
+            swap_f(PUR,  i, maxIdx)
+            swap_f(LEN,  i, maxIdx)
+            swap_f(ERS,  i, maxIdx)
+            swap_f(ATRP, i, maxIdx)
+            swap_f(TURN, i, maxIdx)
+            swap_f(BIAS, i, maxIdx)
+
+// ===== Table =====
+var table t = table.new(TBL_POS, COLS, 60, border_width=BORDER_W)
+
+if drawAlways or barstate.islast
+    // col,row,col,row
+    table.clear(t, 0, 0, COLS - 1, 59)
+
+    // Header
+    table.cell(t, 0, 0,  "#",        bgcolor=HDR_BG, text_color=HDR_TXT)
+    table.cell(t, 1, 0,  "Symbol",   bgcolor=HDR_BG, text_color=HDR_TXT)
+    table.cell(t, 2, 0,  "Rank",     bgcolor=HDR_BG, text_color=HDR_TXT)
+    table.cell(t, 3, 0,  "N",        bgcolor=HDR_BG, text_color=HDR_TXT)
+    table.cell(t, 4, 0,  "Qty/100",  bgcolor=HDR_BG, text_color=HDR_TXT)
+    table.cell(t, 5, 0,  "AvgScore", bgcolor=HDR_BG, text_color=HDR_TXT)
+    table.cell(t, 6, 0,  "AvgER",    bgcolor=HDR_BG, text_color=HDR_TXT)
+    table.cell(t, 7, 0,  "AvgLen",   bgcolor=HDR_BG, text_color=HDR_TXT)
+    table.cell(t, 8, 0,  "Purity%",  bgcolor=HDR_BG, text_color=HDR_TXT)
+    table.cell(t, 9, 0,  "BiasUp",   bgcolor=HDR_BG, text_color=HDR_TXT)
+    table.cell(t,10, 0,  "ATR%",     bgcolor=HDR_BG, text_color=HDR_TXT)
+
+    // Rows (zebra + heatmap)
+    rows = math.min(topN, array.size(RANK))
+    for r = 0 to rows - 1
+        isEven = (r % 2 == 0)
+        rowBg  = isEven ? ROW_EVEN_BG : ROW_ODD_BG
+
+        bgRank = HEATMAP ? heat(array.get(RANK, r), RANK_LO, RANK_HI) : rowBg
+        bgPur  = HEATMAP ? heat(array.get(PUR,  r), PUR_LO,  PUR_HI)  : rowBg
+        bgER   = HEATMAP ? heat(array.get(ERS,  r), ER_LO,   ER_HI)   : rowBg
+
+        table.cell(t, 0,  r+1, str.tostring(r+1),                      bgcolor=rowBg, text_color=ROW_TXT)
+        table.cell(t, 1,  r+1, array.get(SYM,  r),                     bgcolor=rowBg, text_color=ROW_TXT)
+        table.cell(t, 2,  r+1, str.tostring(array.get(RANK,r), "#.2"), bgcolor=bgRank, text_color=ROW_TXT)
+        table.cell(t, 3,  r+1, str.tostring(array.get(N_,  r), "#"),   bgcolor=rowBg, text_color=ROW_TXT)
+        table.cell(t, 4,  r+1, str.tostring(array.get(Q100,r), "#.2"), bgcolor=rowBg, text_color=ROW_TXT)
+        table.cell(t, 5,  r+1, str.tostring(array.get(AVG, r), "#.2"), bgcolor=rowBg, text_color=ROW_TXT)
+        table.cell(t, 6,  r+1, str.tostring(array.get(ERS, r), "#.3"), bgcolor=bgER,  text_color=ROW_TXT)
+        table.cell(t, 7,  r+1, str.tostring(array.get(LEN, r), "#.1"), bgcolor=rowBg, text_color=ROW_TXT)
+        table.cell(t, 8,  r+1, str.tostring(array.get(PUR, r), "#.1"), bgcolor=bgPur, text_color=ROW_TXT)
+        table.cell(t, 9,  r+1, str.tostring(array.get(BIAS,r), "#.2"), bgcolor=rowBg, text_color=ROW_TXT)
+        table.cell(t, 10, r+1, str.tostring(array.get(ATRP,r), "#.1"), bgcolor=rowBg, text_color=ROW_TXT)
+
+// Debug badge (рисуем только на последнем баре, чтобы не плодить метки)
+var label dbg = na
+if debugBadge and barstate.islast
+    if not na(dbg)
+        label.delete(dbg)
+    txt = "Syms: " + str.tostring(sz) + "   minTurn$: " + str.tostring(minTurnUSD, "#")
+    dbg := label.new(bar_index, na, txt, style=label.style_label_left, textcolor=color.white, color=color.new(color.black, 100), size=size.tiny, yloc=yloc.price, xloc=xloc.bar_index)
