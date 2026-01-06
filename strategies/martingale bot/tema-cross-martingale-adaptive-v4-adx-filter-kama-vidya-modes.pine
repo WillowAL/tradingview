@@ -1,0 +1,408 @@
+//@version=5
+strategy('TEMA Cross Martingale (Adaptive V4 + ADX Filter no H + KAMA/VIDYA + Modes)',
+     overlay=true, precision=7, pyramiding=100,
+     default_qty_type=strategy.fixed, default_qty_value=1,
+     initial_capital=100000, commission_type=strategy.commission.percent,
+     commission_value=0.25)
+
+// =====================================================
+// 1. BASE STRUCTURE  (layout like original, but denser)
+// =====================================================
+groupBase = " 1. Base Structure ──────────────"
+
+// Row 1: MA type + Source (one line)
+maType = input.string("TEMA", "Fast MA Type",
+     options=["TEMA","KAMA","VIDYA (CMO)","VIDYA (ER)"], group=groupBase, inline="bs0")
+maSrc  = input.source(close, "Source", group=groupBase, inline="bs0")
+
+// Row 2: TEMA len + SMA len (one line)
+temaLen = input.int(9, "TEMA length", minval=1, group=groupBase, inline="bs1")
+smaLen  = input.int(3, "SMA length",  minval=1, group=groupBase, inline="bs1")
+
+// Row 3: SMMA len + TP% (one line)
+smmaLen        = input.int(2, "SMMA length", minval=1, group=groupBase, inline="bs2")
+minGainPercent = input.float(0.35, "Base TP (%)", step=0.01, group=groupBase, inline="bs2")
+gainMult       = 1 + minGainPercent * 0.01
+
+// Row 4: protections (one line)
+avgProtToggle  = input.bool(true,  "Allow avg only below avg", group=groupBase, inline="bs3")
+gainProtToggle = input.bool(true,  "Require price ≥ TP",       group=groupBase, inline="bs3")
+
+// Row 5: method selector at END of Base Structure (as requested)
+avgMode = input.string("Per order", "Averaging method",
+     options=["Per order","By distance chunks","Legacy drip (soft)","Original (per-bar growth)"],
+     group=groupBase)
+
+// =====================================================
+// KAMA (индивидуальные) — compact
+// =====================================================
+groupKama = "KAMA (индивидуальные) ──────────────"
+
+// Row: ER / Fast / Slow (one line)
+kamaErLen = input.int(10, "ER period", minval=1, group=groupKama, inline="k1")
+kamaFast  = input.int(2,  "Fast",      minval=1, group=groupKama, inline="k1")
+kamaSlow  = input.int(30, "Slow",      minval=2, group=groupKama, inline="k1")
+
+// Row: square smoothing
+kamaSquare = input.bool(true, "Square smoothing (SC²)", group=groupKama)
+
+// =====================================================
+// VIDYA (CMO, индивидуальные) — very compact
+// =====================================================
+groupVidC = "VIDYA (CMO, индивидуальные) ──────────────"
+
+// Row 1: base/cmo/abs (one line)
+vidBaseLen = input.int(10, "Base len", minval=1, group=groupVidC, inline="v1")
+vidCmoLen  = input.int(9,  "CMO len",  minval=1, group=groupVidC, inline="v1")
+vidAbsCmo  = input.bool(true, "|CMO|",  group=groupVidC, inline="v1")
+
+// Row 2: gain/power (one line)
+vidGain  = input.float(1.0, "Gain ×", step=0.1, group=groupVidC, inline="v2")
+vidPower = input.float(1.0, "Power",  step=0.1, group=groupVidC, inline="v2")
+
+// Row 3: clamp (one line)
+vidMinXsc = input.float(0.0, "Min xsc", step=0.01, group=groupVidC, inline="v3")
+vidMaxXsc = input.float(1.0, "Max xsc", step=0.01, group=groupVidC, inline="v3")
+
+// =====================================================
+// VIDYA (ER, индивидуальные) — compact (if you use VIDYA ER)
+// =====================================================
+groupVidE = "VIDYA (ER, индивидуальные) ──────────────"
+vidErBaseLen = input.int(9,  "Base len", minval=1, group=groupVidE, inline="ve1")
+vidErLen     = input.int(10, "ER len",   minval=1, group=groupVidE, inline="ve1")
+
+// =====================================================
+// 2. BOOST  — denser
+// =====================================================
+groupBoost  = " 2. Boost ──────────────"
+
+// Row 1: drop% / mult
+boostDropTh = input.float(0.35, "Boost if drop > (%)", step=0.01, group=groupBoost, inline="b1") * 0.01
+boostMult   = input.float(1.3,  "Boost size multiplier", step=0.1, group=groupBoost, inline="b1")
+
+// Row 2: enable limits
+boostLimEn  = input.bool(true, "Enable boost limits", group=groupBoost)
+
+// Row 3: limits (3 in one line)
+boostMaxTot = input.int(6, "Max boosts", minval=0, group=groupBoost, inline="b2")
+boostMaxSeq = input.int(3, "Max seq",    minval=0, group=groupBoost, inline="b2")
+boostSkipN  = input.int(5, "Skip first N", minval=0, group=groupBoost, inline="b2")
+
+// =====================================================
+// 3. MARTINGALE — denser
+// =====================================================
+groupMart = " 3. Martingale Settings ──────────────"
+
+// Row 1: qty / K0 / dK
+baseQty  = input.float(5,       "Initial qty", step=0.001, group=groupMart, inline="m1")
+k0       = input.float(1.004,   "K₀",         step=0.0001, group=groupMart, inline="m1")
+deltaK   = input.float(0.00004, "ΔK",         step=0.00001, group=groupMart, inline="m1")
+
+// Row 2: quadratic
+quadStep = input.bool(false, "Use quadratic growth?", group=groupMart)
+
+// =====================================================
+// 4. ADAPTIVE DISTANCE — denser
+// =====================================================
+groupDist = " 4. Adaptive Distance Filter ──────────────"
+enableDistFilter = input.bool(true,  "Enable", group=groupDist, inline="d1")
+minDistPct       = input.float(0.25, "minDist %", step=0.01, group=groupDist, inline="d1")
+
+// =====================================================
+// 5. ADX ADAPTIVE FILTER — denser
+// =====================================================
+groupAdx = " 5. ADX Adaptive Filter ──────────────"
+
+// Row 1: enable + disable orders
+enableAdxAdapt        = input.bool(false, "Enable ADX adaptive", group=groupAdx, inline="a0")
+disableOrdersOnFilter = input.bool(false, "Disable orders",      group=groupAdx, inline="a0")
+
+// Row 2: TF + range
+adxTF     = input.timeframe("45", "ADX TF", group=groupAdx, inline="a1")
+i_hlRange = input.int(20, "Level Range", minval=1, group=groupAdx, inline="a1")
+
+// Row 3: sigLen + diLen
+i_sigLen = input.int(14, "sigLen", minval=1, group=groupAdx, inline="a2")
+i_diLen  = input.int(14, "diLen",  minval=1, group=groupAdx, inline="a2")
+
+// Row 4: filter K0 + filter dK
+filterK0     = input.float(1.006, "Filter K₀", step=0.0001, group=groupAdx, inline="a3")
+filterDeltaK = input.float(0.000, "Filter ΔK", step=0.00001, group=groupAdx, inline="a3")
+
+// Row 5: filter minDist
+filterMinDistPct = input.float(0.8, "Filter minDist %", step=0.01, group=groupAdx)
+
+// =====================================================
+// 6–9. MODE SETTINGS (4 groups) — compact
+// =====================================================
+groupM1 = " 6. Mode — Per order ──────────────"
+m1_requireSignal = input.bool(true, "Require signal", group=groupM1, inline="mo1")
+m1_stepsPerOrder = input.int(1, "Steps/order", minval=1, maxval=20, group=groupM1, inline="mo1")
+
+groupM2 = " 7. Mode — By distance chunks ──────────────"
+m2_requireSignal    = input.bool(true, "Require signal", group=groupM2, inline="mo2")
+m2_maxStepsPerOrder = input.int(3, "Max steps/order", minval=1, maxval=50, group=groupM2, inline="mo2")
+
+groupM3 = " 8. Mode — Legacy drip (soft) ──────────────"
+m3_requireSignal    = input.bool(true, "Require signal", group=groupM3, inline="mo3a")
+m3_maxStepsPerOrder = input.int(3, "Max steps/order", minval=1, maxval=50, group=groupM3, inline="mo3a")
+
+m3_stepsPerBar  = input.float(0.25, "Steps/bar", step=0.05, group=groupM3, inline="mo3b")
+m3_capPending   = input.float(5.0,  "Cap pending", step=0.1, group=groupM3, inline="mo3b")
+
+m3_scaleByDist  = input.bool(true,  "Scale by dist", group=groupM3, inline="mo3c")
+m3_freezeOnADX  = input.bool(true,  "Freeze on ADX", group=groupM3, inline="mo3c")
+
+m3_temaScale  = input.float(1.00, "TEMA×",  step=0.05, group=groupM3, inline="mo3d")
+m3_kamaScale  = input.float(0.35, "KAMA×",  step=0.05, group=groupM3, inline="mo3d")
+m3_vidyaScale = input.float(0.50, "VIDYA×", step=0.05, group=groupM3, inline="mo3d")
+
+groupM4 = " 9. Mode — Original (per-bar growth) ──────────────"
+m4_growthMode = input.string("Classic", "Growth",
+     options=["Classic","Throttle"], group=groupM4, inline="mo4")
+m4_everyN = input.int(1, "Every N bars", minval=1, maxval=200, group=groupM4, inline="mo4")
+
+// =====================================================
+// FUNCTIONS
+// =====================================================
+tema(src, len) =>
+    3 * ta.ema(src, len) - 3 * ta.ema(ta.ema(src, len), len) + ta.ema(ta.ema(ta.ema(src, len), len), len)
+
+smma(src, len) =>
+    ta.rma(src, len)
+
+kama(src, erLen, fast, slow, useSquare) =>
+    ch   = math.abs(src - nz(src[erLen]))
+    vola = ta.sma(math.abs(ta.change(src)), erLen) * erLen
+    er   = vola != 0 ? ch / vola : 0.0
+    fastSC = 2.0 / (fast + 1.0)
+    slowSC = 2.0 / (slow + 1.0)
+    sc = er * (fastSC - slowSC) + slowSC
+    sc := useSquare ? math.pow(sc, 2.0) : sc
+    var float k_ = na
+    k_ := na(k_[1]) ? src : k_[1] + sc * (src - k_[1])
+    k_
+
+vidya_cmo_custom(src, baseLen, cmoLen, useAbs, gain, power, minX, maxX) =>
+    alpha = 2.0 / (baseLen + 1.0)
+    cmoRaw = ta.cmo(src, cmoLen) / 100.0
+    c = useAbs ? math.abs(cmoRaw) : math.max(cmoRaw, 0.0)
+    cAdj = math.pow(math.min(1.0, c * gain), power)
+    x = alpha * cAdj
+    lo = math.min(minX, maxX)
+    hi = math.max(minX, maxX)
+    xsc = math.min(hi, math.max(lo, x))
+    var float v_ = na
+    v_ := na(v_[1]) ? src : v_[1] + xsc * (src - v_[1])
+    v_
+
+vidya_er(src, baseLen, erLen) =>
+    ch   = math.abs(src - nz(src[erLen]))
+    vola = ta.sma(math.abs(ta.change(src)), erLen) * erLen
+    er   = vola != 0 ? ch / vola : 0.0
+    alpha = 2.0 / (baseLen + 1.0)
+    sc   = er * alpha
+    var float v_ = na
+    v_ := na(v_[1]) ? src : v_[1] + sc * (src - v_[1])
+    v_
+
+f_dirMov(_len) =>
+    up = ta.change(high)
+    dn = -ta.change(low)
+    p  = nz(up > dn and up > 0 ? up : 0)
+    m  = nz(dn > up and dn > 0 ? dn : 0)
+    trur = ta.rma(ta.tr, _len)
+    [fixnan(100 * ta.rma(p, _len) / trur), fixnan(100 * ta.rma(m, _len) / trur)]
+
+f_sig(_di, _sg) =>
+    [p, m] = f_dirMov(_di)
+    100 * ta.rma(math.abs(p - m) / (p + m == 0 ? 1 : p + m), _sg)
+
+// =====================================================
+// MA CORE + SIGNALS
+// =====================================================
+maCore =
+     maType == "TEMA"        ? tema(maSrc, temaLen) :
+     maType == "KAMA"        ? kama(maSrc, kamaErLen, kamaFast, kamaSlow, kamaSquare) :
+     maType == "VIDYA (CMO)" ? vidya_cmo_custom(maSrc, vidBaseLen, vidCmoLen, vidAbsCmo, vidGain, vidPower, vidMinXsc, vidMaxXsc) :
+                               vidya_er(maSrc, vidErBaseLen, vidErLen)
+
+smaOfCore = ta.sma(maCore, smaLen)
+smma1     = smma(close, smmaLen)
+
+plot(maCore,    color=color.new(color.green, 0),  title="MA")
+plot(smaOfCore, color=color.new(color.orange, 0), title="SMA")
+plot(smma1,     color=color.new(color.red, 0),    title="SMMA")
+
+longCond  = ta.crossover(maCore, smaOfCore) and maCore < smma1
+shortCond = ta.crossunder(maCore, smaOfCore)
+
+// =====================================================
+// ADX FILTER (HTF) + EFFECTIVE PARAMS
+// =====================================================
+[diPlusHTF, diMinusHTF] = request.security(syminfo.tickerid, adxTF, f_dirMov(i_diLen))
+sigHTF                  = request.security(syminfo.tickerid, adxTF, f_sig(i_diLen, i_sigLen))
+
+diDownHTF     = diMinusHTF > diPlusHTF
+aboveRangeHTF = sigHTF > i_hlRange
+filterActive  = enableAdxAdapt and diDownHTF and aboveRangeHTF
+allowOrders   = not (disableOrdersOnFilter and filterActive)
+
+minDistEff = filterActive ? filterMinDistPct : minDistPct
+k0_eff     = filterActive ? filterK0     : k0
+deltaK_eff = filterActive ? filterDeltaK : deltaK
+
+// =====================================================
+// RUNTIME STATE (kept like original)
+// =====================================================
+var float prevBuyPrice = na
+priceMovePct  = na(prevBuyPrice) ? na : math.abs(close - prevBuyPrice) / prevBuyPrice * 100
+distOk        = not enableDistFilter or na(prevBuyPrice) or priceMovePct >= minDistEff
+
+var float lastQty    = baseQty
+var int   qtyStep    = 0
+var int   orderCount = 0
+var int   boostTot   = 0
+var int   boostSeq   = 0
+
+var float pendingSteps = 0.0
+var int   origHoldBars = 0
+
+if strategy.position_size == 0 and strategy.position_size[1] != 0
+    lastQty      := baseQty
+    qtyStep      := 0
+    orderCount   := 0
+    boostTot     := 0
+    boostSeq     := 0
+    prevBuyPrice := na
+    pendingSteps := 0.0
+    origHoldBars := 0
+
+// =====================================================
+// BOOST (same style)
+// =====================================================
+canAvgDown = strategy.position_size > 0 and close < strategy.position_avg_price and distOk
+
+useBoost = canAvgDown and (nz(prevBuyPrice) - close) / nz(prevBuyPrice) >= boostDropTh and
+           (not boostLimEn or (boostTot < boostMaxTot and boostSeq < boostMaxSeq)) and
+           strategy.opentrades >= boostSkipN
+
+// =====================================================
+// ENTRY LOGIC
+// =====================================================
+avgGuard = (na(strategy.position_avg_price) or (avgProtToggle ? close <= strategy.position_avg_price : true))
+
+// ----- Original (per-bar growth) -----
+if avgMode == "Original (per-bar growth)"
+    if strategy.position_size > 0 and close < strategy.position_avg_price and distOk and allowOrders
+        if m4_growthMode == "Classic"
+            qtyStep += 1
+            mult     = quadStep ? deltaK_eff * math.pow(qtyStep, 2) : deltaK_eff * qtyStep
+            lastQty  *= (k0_eff + mult)
+        else
+            origHoldBars += 1
+            if origHoldBars >= m4_everyN
+                origHoldBars := 0
+                qtyStep += 1
+                mult     = quadStep ? deltaK_eff * math.pow(qtyStep, 2) : deltaK_eff * qtyStep
+                lastQty  *= (k0_eff + mult)
+
+    isFirst  = strategy.position_size == 0 and strategy.closedtrades == 0
+    qtyOrder = isFirst ? baseQty : lastQty * (useBoost ? boostMult : 1)
+    qtyOrder := math.ceil(qtyOrder * 1000) / 1000
+
+    canEnter = longCond and distOk and allowOrders and avgGuard
+    if canEnter
+        strategy.entry("Buy", strategy.long, qty=qtyOrder)
+        orderCount  += 1
+        prevBuyPrice := close
+        label.new(bar_index, high, str.tostring(orderCount), style=label.style_none,
+                  textcolor=color.gray, yloc=yloc.abovebar, size=size.small)
+
+        if useBoost
+            boostTot += 1
+            boostSeq += 1
+        else
+            boostSeq := 0
+
+// ----- Other modes -----
+else
+    // First entry
+    canFirst = strategy.position_size == 0 and longCond and distOk and allowOrders
+    if canFirst
+        qtyStep      := 0
+        lastQty      := baseQty
+        prevBuyPrice := close
+        pendingSteps := 0.0
+        origHoldBars := 0
+        orderCount += 1
+        strategy.entry("Buy", strategy.long, qty=math.ceil(baseQty * 1000) / 1000)
+        label.new(bar_index, high, str.tostring(orderCount), style=label.style_none,
+                  textcolor=color.gray, yloc=yloc.abovebar, size=size.small)
+        boostSeq := 0
+
+    // Drip accumulation
+    if avgMode == "Legacy drip (soft)" and strategy.position_size > 0 and close < strategy.position_avg_price and distOk and allowOrders
+        maScale = maType == "TEMA" ? m3_temaScale : maType == "KAMA" ? m3_kamaScale : m3_vidyaScale
+        distRatio = (na(priceMovePct) or minDistEff == 0) ? 1.0 : math.max(1.0, priceMovePct / minDistEff)
+        inc = m3_stepsPerBar * maScale * (m3_scaleByDist ? distRatio : 1.0)
+        inc := (m3_freezeOnADX and filterActive) ? 0.0 : inc
+        pendingSteps := math.min(m3_capPending, pendingSteps + inc)
+
+    // Per-mode signal requirement
+    reqSig =
+         avgMode == "Per order"          ? m1_requireSignal :
+         avgMode == "By distance chunks" ? m2_requireSignal :
+                                          m3_requireSignal
+    signalOk = reqSig ? longCond : true
+
+    // Averaging entry condition
+    canAvgEnter = strategy.position_size > 0 and close < strategy.position_avg_price and distOk and allowOrders and signalOk and avgGuard
+    if canAvgEnter
+        stepsToApply = 1
+
+        if avgMode == "Per order"
+            stepsToApply := m1_stepsPerOrder
+
+        if avgMode == "By distance chunks"
+            chunks = int(math.floor(priceMovePct / minDistEff))
+            stepsToApply := math.min(m2_maxStepsPerOrder, math.max(1, chunks))
+
+        if avgMode == "Legacy drip (soft)"
+            stepsToApply := math.min(m3_maxStepsPerOrder, math.max(1, int(math.floor(pendingSteps))))
+            pendingSteps := math.max(0.0, pendingSteps - stepsToApply)
+
+        for _ = 1 to stepsToApply
+            qtyStep += 1
+            mult     = quadStep ? deltaK_eff * math.pow(qtyStep, 2) : deltaK_eff * qtyStep
+            lastQty  *= (k0_eff + mult)
+
+        qtyOrder = lastQty * (useBoost ? boostMult : 1)
+        qtyOrder := math.ceil(qtyOrder * 1000) / 1000
+
+        strategy.entry("Buy", strategy.long, qty=qtyOrder)
+        orderCount  += 1
+        prevBuyPrice := close
+
+        label.new(bar_index, high, str.tostring(orderCount), style=label.style_none,
+                  textcolor=color.gray, yloc=yloc.abovebar, size=size.small)
+
+        if useBoost
+            boostTot += 1
+            boostSeq += 1
+        else
+            boostSeq := 0
+
+// =====================================================
+// TAKE PROFIT / CLOSE (original behavior)
+// =====================================================
+gainCondition = not na(strategy.position_avg_price) and (gainProtToggle ? close >= gainMult * strategy.position_avg_price : false)
+if shortCond and gainCondition
+    strategy.close_all()
+
+// =====================================================
+// BOOST MARKER
+// =====================================================
+plotshape(useBoost and strategy.opentrades > strategy.opentrades[1],
+      title="BoostDot", style=shape.circle, size=size.tiny,
+      color=color.new(color.aqua, 0), location=location.abovebar)
