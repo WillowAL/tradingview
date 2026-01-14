@@ -1,8 +1,8 @@
 //@version=5
-// STRATEGY_ID:
-// State: STABLE / LIVE_SAFE / BACKTEST_CLEAN / EXPERIMENT / ARCHIVE
+// STRATEGY_ID: TEMA Cross — Pure Swing
+// State: ORIGINAL (bar closed)
 // DATE: 2026-01-13
-// Features:
+// Features: 
 // NOTES: ...
 strategy("TEMA Cross — Pure Swing (v2+ME, LIVE bar-close)",
      overlay=true, precision=7,
