@@ -1,0 +1,140 @@
+//@version=5
+// STRATEGY_ID:
+// State: STABLE / LIVE_SAFE / BACKTEST_CLEAN / EXPERIMENT / ARCHIVE
+// DATE: 2026-01-13
+// Features:
+// NOTES: ...
+strategy("TEMA Cross — Pure Swing (v2+ME, LIVE bar-close)",
+     overlay=true, precision=7,
+     pyramiding=0,
+     commission_type=strategy.commission.percent, commission_value=0.036,
+     process_orders_on_close=true,
+     calc_on_order_fills=true,
+     calc_on_every_tick=false,
+     // фиксируем тип количества контрактов
+     default_qty_type=strategy.fixed, default_qty_value=1)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Helpers
+tema(src, len) =>
+    3*ta.ema(src, len) - 3*ta.ema(ta.ema(src, len), len) + ta.ema(ta.ema(ta.ema(src, len), len), len)
+
+// Kaufman ER (без ta.sum — через SMA*n)
+er_ratio(src, length) =>
+    _n   = math.max(1, length)
+    chg  = math.abs(src - nz(src[_n - 1], src))
+    avg  = ta.sma(math.abs(src - src[1]), _n)   // среднее |Δ|
+    vol  = nz(avg, 0.0) * _n                    // сумма |Δ| = SMA * n
+    vol <= 0.0 or na(vol) ? 0.0 : math.min(1.0, chg/vol)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Inputs — ядро (компакт)
+groupCore   = "FAST MA (ядро)"
+maType      = input.string("TEMA", "Type", options=["TEMA","KAMA","VIDYA (CMO)"], group=groupCore, inline="c0")
+src         = input.source(close, "Source", group=groupCore, inline="c0")
+fastLen     = input.int(10, "Fast length",  minval=1, group=groupCore, inline="c1")
+smaLen      = input.int(2,  "Anchor len",   minval=1, group=groupCore, inline="c1")
+
+// Inputs — KAMA
+groupKAMA   = "KAMA (индивидуальные)"
+kamaErLen   = input.int(10, "ER period",  minval=1, group=groupKAMA, inline="k1")
+kamaFastLen = input.int(2,  "Fast",       minval=1, group=groupKAMA, inline="k1")
+kamaSlowLen = input.int(30, "Slow",       minval=2, group=groupKAMA, inline="k1")
+kamaSqSC    = input.bool(true, "Square smoothing (SC²)", group=groupKAMA)
+
+// Inputs — VIDYA (CMO)
+groupVIDYA   = "VIDYA (CMO, индивидуальные)"
+vidyaLen     = input.int(10,   "Base len",    minval=1,   group=groupVIDYA, inline="v1")
+vidyaCmoLen  = input.int(9,    "CMO len",     minval=1,   group=groupVIDYA, inline="v1")
+vidyaUseAbs  = input.bool(true,"|CMO|",                     group=groupVIDYA, inline="v1")
+vidyaGain    = input.float(1.0,"Gain ×",     minval=0,   maxval=5, step=0.05, group=groupVIDYA, inline="v2")
+vidyaPower   = input.float(1.0,"Power",      minval=0.5, maxval=3, step=0.1,  group=groupVIDYA, inline="v2")
+vidyaMinMult = input.float(0.0,"Min ×sc",    minval=0,   maxval=1, step=0.05, group=groupVIDYA, inline="v3")
+vidyaMaxMult = input.float(1.0,"Max ×sc",    minval=0.1, maxval=5, step=0.05, group=groupVIDYA, inline="v3")
+
+// Торговый блок
+qtyFixed        = input.float(6, "Order size (qty)", minval=0.0, step=0.1)
+oneActionPerBar = input.bool(true,  "One action per bar (debounce same-bar)")
+
+//──────────────────────────────────────────────────────────────────────────────
+// Fast MA compute (основной поток)
+temaFast = tema(src, fastLen)
+
+// KAMA
+var float kamaVal = na
+erKama   = er_ratio(src, kamaErLen)
+kSCf     = 2.0/(kamaFastLen + 1.0)
+kSCs     = 2.0/(kamaSlowLen + 1.0)
+kSC      = erKama*(kSCf - kSCs) + kSCs
+kSC      := kamaSqSC ? math.pow(kSC, 2.0) : kSC
+kPrev    = nz(kamaVal[1], src)
+kamaVal := kPrev + kSC*(src - kPrev)
+
+// VIDYA (CMO)
+var float vidyaVal = na
+scBase   = 2.0/(vidyaLen + 1.0)
+cmo      = ta.cmo(src, vidyaCmoLen)
+mag      = vidyaUseAbs ? math.abs(cmo) : math.max(cmo, 0)
+norm     = math.min(1.0, math.max(0.0, mag/100.0))
+kStep    = scBase * vidyaGain * math.pow(norm, vidyaPower)
+kStep    := math.max(scBase*vidyaMinMult, math.min(scBase*vidyaMaxMult, kStep))
+vPrev    = nz(vidyaVal[1], src)
+vidyaVal := vPrev + kStep*(src - vPrev)
+
+// Выбор активной быстрой МА
+fastMA = maType == "TEMA" ? temaFast : maType == "KAMA" ? kamaVal : vidyaVal
+anchor = ta.sma(fastMA, smaLen)   // якорь
+diff   = fastMA - anchor
+
+//──────────────────────────────────────────────────────────────────────────────
+// Signals
+wantLong  = diff > 0
+wantShort = diff < 0
+longRaw   = ta.crossover(fastMA, anchor)
+shortRaw  = ta.crossunder(fastMA, anchor)
+
+//──────────────────────────────────────────────────────────────────────────────
+// State / telemetry
+var int lastTradeBar = na
+pos = strategy.position_size
+
+//──────────────────────────────────────────────────────────────────────────────
+// Основная торговля (только кроссы, bar-close)
+canTrade = not oneActionPerBar or na(lastTradeBar) or bar_index != lastTradeBar
+
+needFlipToLong  = pos < 0 and longRaw
+needFlipToShort = pos > 0 and shortRaw
+flatEnterLong   = pos == 0 and longRaw  and not shortRaw
+flatEnterShort  = pos == 0 and shortRaw and not longRaw
+
+if canTrade
+    if needFlipToShort
+        strategy.entry("Short", strategy.short, qty=qtyFixed)
+        lastTradeBar := bar_index
+    else if needFlipToLong
+        strategy.entry("Long", strategy.long, qty=qtyFixed)
+        lastTradeBar := bar_index
+    else
+        if flatEnterLong
+            strategy.entry("Long",  strategy.long,  qty=qtyFixed)
+            lastTradeBar := bar_index
+        else if flatEnterShort
+            strategy.entry("Short", strategy.short, qty=qtyFixed)
+            lastTradeBar := bar_index
+
+//──────────────────────────────────────────────────────────────────────────────
+// Plots & diagnostics
+plot(fastMA,  color=color.new(color.teal,   0), title="Fast (selected)")
+plot(anchor,  color=color.new(color.orange, 0), title="Anchor = SMA(Fast)")
+
+plotshape(longRaw,  title="L raw", style=shape.triangleup,   location=location.belowbar,
+          color=color.new(color.green, 70), size=size.tiny, text="L")
+plotshape(shortRaw, title="S raw", style=shape.triangledown, location=location.abovebar,
+          color=color.new(color.red,   70), size=size.tiny, text="S")
+
+enteredLong  = strategy.position_size > 0 and strategy.position_size[1] <= 0
+enteredShort = strategy.position_size < 0 and strategy.position_size[1] >= 0
+plotshape(enteredLong,  title="Long filled",  style=shape.triangleup,   location=location.belowbar,
+          color=color.new(color.green, 0), size=size.tiny, text="Long")
+plotshape(enteredShort, title="Short filled", style=shape.triangledown, location=location.abovebar,
+          color=color.new(color.red,   0), size=size.tiny, text="Short")

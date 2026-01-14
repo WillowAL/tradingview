@@ -1,0 +1,218 @@
+//@version=5
+// STRATEGY_ID:
+// State: STABLE / LIVE_SAFE / BACKTEST_CLEAN / EXPERIMENT / ARCHIVE
+// DATE: 2026-01-13
+// Features:
+// NOTES: ...
+strategy("TEMA Cross — Pure Swing (v2+ME, LIVE bar-close, Simple TP)",
+     overlay=true, precision=7,
+     pyramiding=0,
+     commission_type=strategy.commission.percent, commission_value=0.036,
+     process_orders_on_close=true,
+     calc_on_order_fills=true,
+     calc_on_every_tick=false,
+     // фиксируем тип количества контрактов
+     default_qty_type=strategy.fixed, default_qty_value=1)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Helpers
+tema(src, len) =>
+    3*ta.ema(src, len) - 3*ta.ema(ta.ema(src, len), len) + ta.ema(ta.ema(ta.ema(src, len), len), len)
+
+// Kaufman ER (без ta.sum — через SMA*n)
+er_ratio(src, length) =>
+    _n   = math.max(1, length)
+    chg  = math.abs(src - nz(src[_n - 1], src))
+    avg  = ta.sma(math.abs(src - src[1]), _n)   // среднее |Δ|
+    vol  = nz(avg, 0.0) * _n                    // сумма |Δ| = SMA * n
+    vol <= 0.0 or na(vol) ? 0.0 : math.min(1.0, chg/vol)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Inputs — ядро (компакт)
+groupCore   = "FAST MA (ядро)"
+maType      = input.string("TEMA", "Type", options=["TEMA","KAMA","VIDYA (CMO)"], group=groupCore, inline="c0")
+src         = input.source(close, "Source", group=groupCore, inline="c0")
+fastLen     = input.int(10, "Fast length",  minval=1, group=groupCore, inline="c1")
+smaLen      = input.int(2,  "Anchor len",   minval=1, group=groupCore, inline="c1")
+
+// Inputs — KAMA
+groupKAMA   = "KAMA (индивидуальные)"
+kamaErLen   = input.int(10, "ER period",  minval=1, group=groupKAMA, inline="k1")
+kamaFastLen = input.int(2,  "Fast",       minval=1, group=groupKAMA, inline="k1")
+kamaSlowLen = input.int(30, "Slow",       minval=2, group=groupKAMA, inline="k1")
+kamaSqSC    = input.bool(true, "Square smoothing (SC²)", group=groupKAMA)
+
+// Inputs — VIDYA (CMO)
+groupVIDYA   = "VIDYA (CMO, индивидуальные)"
+vidyaLen     = input.int(10,   "Base len",    minval=1,   group=groupVIDYA, inline="v1")
+vidyaCmoLen  = input.int(9,    "CMO len",     minval=1,   group=groupVIDYA, inline="v1")
+vidyaUseAbs  = input.bool(true,"|CMO|",                        group=groupVIDYA, inline="v1")
+vidyaGain    = input.float(1.0,"Gain ×",     minval=0,   maxval=5, step=0.05, group=groupVIDYA, inline="v2")
+vidyaPower   = input.float(1.0,"Power",      minval=0.5, maxval=3, step=0.1,  group=groupVIDYA, inline="v2")
+vidyaMinMult = input.float(0.0,"Min ×sc",    minval=0,   maxval=1, step=0.05, group=groupVIDYA, inline="v3")
+vidyaMaxMult = input.float(1.0,"Max ×sc",    minval=0.1, maxval=5, step=0.05, group=groupVIDYA, inline="v3")
+
+// Торговый блок
+qtyFixed        = input.float(6, "Order size (qty)", minval=0.0, step=0.1)
+oneActionPerBar = input.bool(true,  "One action per bar (debounce same-bar)")
+
+//──────────────────────────────────────────────────────────────────────────────
+// Simple structural partial TP (отдельная TEMA для тейк-профита)
+groupTP        = "Simple partial TP (TEMA)"
+usePartialTP   = input.bool(false, "Use partial TP", group=groupTP)
+tpQtyPct       = input.float(40.0, "TP size, % of position", minval=0.0, maxval=100.0, step=5.0, group=groupTP)
+tpTemaLen      = input.int(6, "TP TEMA length", minval=1, group=groupTP, inline="t1")
+tpAnchorLen    = input.int(2, "TP anchor len",  minval=1, group=groupTP, inline="t1")
+tpMinProfitPct = input.float(1.0, "Min profit for TP, %", step=0.1, group=groupTP)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Fast MA compute (основной поток)
+temaFast = tema(src, fastLen)
+
+// KAMA
+var float kamaVal = na
+erKama   = er_ratio(src, kamaErLen)
+kSCf     = 2.0/(kamaFastLen + 1.0)
+kSCs     = 2.0/(kamaSlowLen + 1.0)
+kSC      = erKama*(kSCf - kSCs) + kSCs
+kSC      := kamaSqSC ? math.pow(kSC, 2.0) : kSC
+kPrev    = nz(kamaVal[1], src)
+kamaVal := kPrev + kSC*(src - kPrev)
+
+// VIDYA (CMO)
+var float vidyaVal = na
+scBase   = 2.0/(vidyaLen + 1.0)
+cmo      = ta.cmo(src, vidyaCmoLen)
+mag      = vidyaUseAbs ? math.abs(cmo) : math.max(cmo, 0)
+norm     = math.min(1.0, math.max(0.0, mag/100.0))
+kStep    = scBase * vidyaGain * math.pow(norm, vidyaPower)
+kStep    := math.max(scBase*vidyaMinMult, math.min(scBase*vidyaMaxMult, kStep))
+vPrev    = nz(vidyaVal[1], src)
+vidyaVal := vPrev + kStep*(src - vPrev)
+
+// Выбор активной быстрой МА для входов
+fastMA = maType == "TEMA" ? temaFast : maType == "KAMA" ? kamaVal : vidyaVal
+anchor = ta.sma(fastMA, smaLen)   // якорь
+diff   = fastMA - anchor
+
+//──────────────────────────────────────────────────────────────────────────────
+// СВОЯ TEMA для простого структурного TP
+tpFast   = tema(src, tpTemaLen)
+tpAnchor = ta.sma(tpFast, tpAnchorLen)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Signals
+wantLong  = diff > 0
+wantShort = diff < 0
+longRaw   = ta.crossover(fastMA, anchor)
+shortRaw  = ta.crossunder(fastMA, anchor)
+
+//──────────────────────────────────────────────────────────────────────────────
+// State / telemetry
+var int lastTradeBar = na
+pos         = strategy.position_size
+posPrev     = strategy.position_size[1]
+entryPrice  = strategy.position_avg_price
+
+longNow   = pos > 0
+shortNow  = pos < 0
+flatNow   = pos == 0
+longPrev  = posPrev > 0
+shortPrev = posPrev < 0
+flatPrev  = posPrev == 0
+
+// Флаги для простого TP (по одному срабатыванию на удержание)
+var bool tpDoneLong  = false
+var bool tpDoneShort = false
+
+// Сброс TP-флагов при выходе в 0 или смене направления
+if flatNow and not flatPrev
+    tpDoneLong  := false
+    tpDoneShort := false
+
+if longNow and not longPrev
+    tpDoneLong  := false
+    tpDoneShort := false
+
+if shortNow and not shortPrev
+    tpDoneLong  := false
+    tpDoneShort := false
+
+// Текущий профит в %
+profitPctLong  = longNow  and entryPrice > 0 ? (close - entryPrice) / entryPrice * 100.0 : 0.0
+profitPctShort = shortNow and entryPrice > 0 ? (entryPrice - close) / entryPrice * 100.0 : 0.0
+
+//──────────────────────────────────────────────────────────────────────────────
+// Основная торговля (только кроссы, bar-close)
+canActThisBar = not oneActionPerBar or na(lastTradeBar) or bar_index != lastTradeBar
+
+needFlipToLong  = pos < 0 and longRaw
+needFlipToShort = pos > 0 and shortRaw
+flatEnterLong   = pos == 0 and longRaw  and not shortRaw
+flatEnterShort  = pos == 0 and shortRaw and not longRaw
+
+// 1) Flip / входы
+if canActThisBar
+    if needFlipToShort
+        strategy.entry("Short", strategy.short, qty=qtyFixed)
+        lastTradeBar := bar_index
+    else if needFlipToLong
+        strategy.entry("Long", strategy.long, qty=qtyFixed)
+        lastTradeBar := bar_index
+    else
+        if flatEnterLong
+            strategy.entry("Long",  strategy.long,  qty=qtyFixed)
+            lastTradeBar := bar_index
+        else if flatEnterShort
+            strategy.entry("Short", strategy.short, qty=qtyFixed)
+            lastTradeBar := bar_index
+
+// 2) Простой частичный TP по структуре TEMA (если бар ещё свободен)
+canTPThisBar = not oneActionPerBar or na(lastTradeBar) or bar_index != lastTradeBar
+
+if usePartialTP and canTPThisBar
+    // Лонг: в плюсе и TEMA TP ломает структуру (crossunder)
+    if longNow and not tpDoneLong and profitPctLong >= tpMinProfitPct and ta.crossunder(tpFast, tpAnchor)
+        qtyToClose = math.abs(pos) * tpQtyPct / 100.0
+        if qtyToClose > 0
+            strategy.order("L_PTP", strategy.short, qty=qtyToClose, comment="Simple TP TEMA")
+            tpDoneLong  := true
+            lastTradeBar := bar_index
+
+    // Шорт: в плюсе и TEMA TP ломает структуру (crossover)
+    if shortNow and not tpDoneShort and profitPctShort >= tpMinProfitPct and ta.crossover(tpFast, tpAnchor)
+        qtyToClose = math.abs(pos) * tpQtyPct / 100.0
+        if qtyToClose > 0
+            strategy.order("S_PTP", strategy.long, qty=qtyToClose, comment="Simple TP TEMA")
+            tpDoneShort := true
+            lastTradeBar := bar_index
+
+//──────────────────────────────────────────────────────────────────────────────
+// Plots & diagnostics
+plot(fastMA,  color=color.new(color.teal,   0), title="Fast (selected)")
+plot(anchor,  color=color.new(color.orange, 0), title="Anchor = SMA(Fast)")
+
+// Отдельно рисуем TEMA для TP, чтобы видеть, где она стреляет
+plot(usePartialTP ? tpFast   : na, color=color.new(color.blue,  30), title="TP TEMA")
+plot(usePartialTP ? tpAnchor : na, color=color.new(color.purple,30), title="TP anchor")
+
+plotshape(longRaw,  title="L raw", style=shape.triangleup,   location=location.belowbar,
+          color=color.new(color.green, 70), size=size.tiny, text="L")
+plotshape(shortRaw, title="S raw", style=shape.triangledown, location=location.abovebar,
+          color=color.new(color.red,   70), size=size.tiny, text="S")
+
+enteredLong  = strategy.position_size > 0 and strategy.position_size[1] <= 0
+enteredShort = strategy.position_size < 0 and strategy.position_size[1] >= 0
+plotshape(enteredLong,  title="Long filled",  style=shape.triangleup,   location=location.belowbar,
+          color=color.new(color.green, 0), size=size.tiny, text="Long")
+plotshape(enteredShort, title="Short filled", style=shape.triangledown, location=location.abovebar,
+          color=color.new(color.red,   0), size=size.tiny, text="Short")
+
+// Маркеры простого TP
+plotshape(usePartialTP and longNow  and ta.crossunder(tpFast, tpAnchor),
+          title="TP L trig", style=shape.circle, location=location.abovebar,
+          color=color.new(color.blue, 0), size=size.tiny, text="TP")
+
+plotshape(usePartialTP and shortNow and ta.crossover(tpFast, tpAnchor),
+          title="TP S trig", style=shape.circle, location=location.belowbar,
+          color=color.new(color.purple, 0), size=size.tiny, text="TP")
