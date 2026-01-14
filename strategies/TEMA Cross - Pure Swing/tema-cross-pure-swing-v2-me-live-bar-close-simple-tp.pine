@@ -1,8 +1,8 @@
 //@version=5
 // STRATEGY_ID:
-// State: STABLE / LIVE_SAFE / BACKTEST_CLEAN / EXPERIMENT / ARCHIVE
+// State: EXPERIMENT 
 // DATE: 2026-01-13
-// Features:
+// Features: Original + TEMA Take Profit by opposite signal
 // NOTES: ...
 strategy("TEMA Cross — Pure Swing (v2+ME, LIVE bar-close, Simple TP)",
      overlay=true, precision=7,
