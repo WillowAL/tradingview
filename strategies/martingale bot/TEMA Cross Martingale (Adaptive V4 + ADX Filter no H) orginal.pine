@@ -1,6 +1,6 @@
 //@version=5
-// STRATEGY_ID:
-// State: STABLE / LIVE_SAFE / BACKTEST_CLEAN / EXPERIMENT / ARCHIVE
+// STRATEGY_ID: TEMA Cross Martingale 
+// State: ORIGINAL
 // DATE: 2026-01-13
 // Features:
 // NOTES: ...
