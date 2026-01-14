@@ -1,8 +1,8 @@
 //@version=5
-// STRATEGY_ID:
-// State: STABLE / LIVE_SAFE / BACKTEST_CLEAN / EXPERIMENT / ARCHIVE
+// STRATEGY_ID: TEMA Cross Martingale
+// State: EXPERIMENT 
 // DATE: 2026-01-13
-// Features:
+// Features: ORIGINAL + KAMA/VIDYA + Modes - разные моды мартингейла для KAMA/VIDYA
 // NOTES: ...
 strategy('TEMA Cross Martingale (Adaptive V4 + ADX Filter no H + KAMA/VIDYA + Modes)',
      overlay=true, precision=7, pyramiding=100,
