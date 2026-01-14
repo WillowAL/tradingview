@@ -1,4 +1,9 @@
 //@version=5
+// STRATEGY_ID:
+// State: STABLE / LIVE_SAFE / BACKTEST_CLEAN / EXPERIMENT / ARCHIVE
+// DATE: 2026-01-13
+// Features:
+// NOTES: ...
 strategy('TEMA Cross Martingale (Adaptive V4 + ADX Filter no H)',
      overlay=true, precision=7, pyramiding=100,
      default_qty_type=strategy.fixed, default_qty_value=1,

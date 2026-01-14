@@ -1,4 +1,9 @@
 //@version=5
+// STRATEGY_ID:
+// State: STABLE / LIVE_SAFE / BACKTEST_CLEAN / EXPERIMENT / ARCHIVE
+// DATE: 2026-01-13
+// Features:
+// NOTES: ...
 indicator("ZigZag Impulse Screener — Quality × Quantity (v2.6 fixed UI, HA purity, frozen threshold)", overlay=false, max_bars_back=5000)
 
 // ===== Inputs =====
